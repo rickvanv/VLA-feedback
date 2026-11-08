@@ -4,14 +4,18 @@
 
 Starting from the baseline [`MicroVLA`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L310-L363) (`117,248` parameters), we implemented a recurrent feedback weight-switching architecture, a parameter-matched feedforward control, a partial-observability (target occlusion) benchmark, and a controlled multi-seed evaluation harness.
 
-### A. Target Occlusion & Environment Updates ([`micro_vla.py`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py))
+### A. Target Occlusion & Moving-Target Environment Updates ([`micro_vla.py`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py))
 - **Independent Per-Color Occlusion Windows**:
-  - Added [`sample_occlusion_window`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L118-L125), [`sample_occlusion`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L128-L143), and [`hidden_colors_at`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L146-L152) so each target color (`red`, `green`, `blue`) independently disappears for a random window of `2–4` consecutive frames (with probability `occlusion_prob`, default `0.7` in occlusion experiments) after the first `2` visible frames.
-  - Updated [`render_env`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L99-L115) to accept `hidden_colors`, selectively omitting occluded target dots while keeping the white gripper and non-occluded targets visible.
-  - Updated [`generate_vla_dataset`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L168-L237) to support `occlusion_prob` and `return_hidden=True`, returning a per-sample boolean mask indicating whether the prompted target was occluded at that timestep.
+  - Added [`sample_occlusion_window`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L127-L134), [`sample_occlusion`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L137-L152), and [`hidden_colors_at`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L155-L161) so each target color (`red`, `green`, `blue`) independently disappears for a random window of `2–4` consecutive frames (with probability `occlusion_prob`, default `0.7` in occlusion experiments) after the first `2` visible frames.
+  - Updated [`render_env`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L108-L124) to accept `hidden_colors`, selectively omitting occluded target dots while keeping the white gripper and non-occluded targets visible.
+  - Updated [`generate_vla_dataset`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L238-L315) to support `occlusion_prob`, `target_speed`, and `return_hidden=True`, returning a per-sample boolean mask indicating whether the prompted target was occluded at that timestep.
+- **Slow Linear Non-Colliding Target Motion**:
+  - Added [`sample_target_velocities`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L186-L225), [`_segments_min_dist`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L177-L183), and [`step_targets`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L228-L235) with default `TARGET_SPEED = 0.7` px/step (`< MAX_STEP_PX = 2.2` px/step) and `MIN_TARGET_DIST = 6.0` px.
+  - Each target moves along a constant-velocity straight line segment $\mathbf{p}_c(t) = \mathbf{p}_c(0) + t\mathbf{v}_c$ guaranteed to stay within the workspace bounds `[3.5, 27.5]^2` and maintain a continuous center-to-center separation $\ge 6.0$ px between every pair of targets for all $t \in [0, T]$ (preventing any collision between the $3\times 3$ target squares).
+  - The expert controller aims at the target's next position along its line (`next_targets[target_color]`), making velocity direction relevant to optimal action prediction.
 - **Visualization Enhancements**:
-  - Updated [`save_demo_gif`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L547-L701) to accept custom titles and display the active FFN weight set (`W:A` or `W:B`) per timestep when visualizing rollouts from the feedback model.
-  - Updated `SEED` to `24` in [`micro_vla.py`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L22).
+  - Updated [`save_demo_gif`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L565-L719) to accept custom titles and display the active FFN weight set (`W:A` or `W:B`) per timestep when visualizing rollouts from the feedback model.
+  - Updated `SEED` to `24` and added automatic accelerator selection (`cuda` / `mps` / `cpu` via `DEVICE`) in [`micro_vla.py`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L24-L32).
 
 ---
 
@@ -70,6 +74,19 @@ When evaluated under identical training budgets (`520` steps, `24` streams $\tim
 1. **Active Compute per Forward Pass**: Although both models have `137,307` parameters, `SequentialMicroVLA` applies *both* `FFN_A` and `FFN_B` on every forward pass (increasing effective depth and active FLOPs per token), whereas hard routing in `FeedbackMicroVLA` only activates *one* FFN weight set (`16,576` parameters) per step.
 2. **1-Bit Information Bottleneck in Hard Gate Routing**: In `FeedbackMicroVLA`, the recurrent state $h_{t-1}$ only influences step $t$ through a binary choice $g_t \in \{A, B\}$ of block-0 FFN weights (`1 bit` of information per step). A 1-bit discrete switch cannot encode continuous 2D spatial coordinates $(x, y)$ of an occluded target across frames, explaining why `val_ce_occluded` (`1.605`) does not beat the memoryless sequential baseline (`1.554`). To carry spatial target memory across occluded frames, $h_{t-1}$ needs a continuous residual/token pathway (or KV-cache recurrence) rather than solely a discrete binary gate.
 3. **Training Throughput & Sample Diversity per Step**: Training on `8` episodes (`24` streams $\times 10$ correlated frames $= 240$ sequences) with sequential unrolling is ~1.8$\times$ slower per step than flattened parallel execution and has lower state diversity per gradient update than standard i.i.d. state sampling (`24` independent states $\times 3$ prompts in [`train_vla`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L369-L410)), requiring more optimization steps when training on occluded episode streams.
+
+### Finding 3: Moving-Target Experiment (`--target-speed 0.7 --occlusion-prob 0.0`)
+When targets move slowly along non-colliding straight lines (`0.7` px/step, minimum separation `6.0` px) and the expert aims at the target's next step position along its line, a single frame cannot disambiguate the target's velocity direction. Across `3` seeds (`[0, 1, 2]`, `520` steps):
+
+| Metric (Mean $\pm$ Std over Seeds `0, 1, 2`) | `FeedbackMicroVLA` (`137,307` params) | `SequentialMicroVLA` (`137,307` params) |
+| :--- | :---: | :---: |
+| **`train_ce (last 20)`** | **`1.281 ± 0.082`** | `1.359 ± 0.138` |
+| **`val_ce_visible`** | **`1.452 ± 0.097`** | `1.487 ± 0.123` |
+| **`final_dist_px`** | `9.839 ± 1.955` | **`8.742 ± 2.919`** |
+| **`success_rate (< 1.5px)`** | `0.052 ± 0.050` | **`0.063 ± 0.042`** |
+
+- **Lower Action Token Cross-Entropy with Feedback**: Unlike the static-target occlusion setting, `FeedbackMicroVLA` achieves lower training cross-entropy (`1.281` vs. `1.359`) and lower validation cross-entropy (`1.452` vs. `1.487`) than `SequentialMicroVLA` when targets move along lines, as the recurrent state $h_{t-1}$ provides temporal context across consecutive frames.
+- **Closed-Loop Tracking**: In 15-step closed-loop rollouts where targets continuously move, `SequentialMicroVLA` still edges out slightly on final Euclidean distance (`8.742px` vs. `9.839px`), reflecting the benefit of using both FFN blocks on every step when executing coarse pursuit movements.
 
 ---
 

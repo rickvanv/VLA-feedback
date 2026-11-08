@@ -49,6 +49,7 @@ from micro_vla import (
     NUM_BINS,
     NUM_PATCHES,
     PATCH_SIZE,
+    TARGET_SPEED,
     VOCAB_SIZE,
     X_OFFSET,
     Y_OFFSET,
@@ -62,7 +63,9 @@ from micro_vla import (
     print_ascii_rollout,
     render_env,
     sample_env_state,
+    sample_target_velocities,
     save_demo_gif,
+    step_targets,
     stoi,
 )
 
@@ -91,7 +94,7 @@ class SwitchedLinear(nn.Module):
 
 
 class FeedbackTransformerBlock(nn.Module):
-    """Pre-norm block whose FFN weights are selected per sample by a feedback gate."""
+    """Pre-norm block whose FFN weights are selected or linearly mixed per sample by a feedback gate."""
 
     def __init__(self, d_model: int = 64, n_heads: int = 4):
         super().__init__()
@@ -101,9 +104,17 @@ class FeedbackTransformerBlock(nn.Module):
         self.fc1 = SwitchedLinear(d_model, 2 * d_model)
         self.fc2 = SwitchedLinear(2 * d_model, d_model)
 
-    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, g: torch.Tensor, mix_branches: bool = False) -> torch.Tensor:
         x = x + self.attn(self.ln1(x))
-        x = x + self.fc2(F.gelu(self.fc1(self.ln2(x), g)), g)
+        x_ln = self.ln2(x)
+        if mix_branches:
+            # Linear combination of the two FFN branch outputs with signed 2D basis weights g in [-1, 1]^2:
+            # Delta_x = g[:, 0] * FFN_A(x_ln) + g[:, 1] * FFN_B(x_ln)
+            h = F.gelu(torch.einsum("bti,koi->btko", x_ln, self.fc1.weight) + self.fc1.bias)
+            y = torch.einsum("btkh,koh->btko", h, self.fc2.weight) + self.fc2.bias
+            x = x + torch.einsum("bk,btko->bto", g, y)
+        else:
+            x = x + self.fc2(F.gelu(self.fc1(x_ln, g)), g)
         return x
 
 
@@ -111,7 +122,10 @@ class FeedbackTransformerBlock(nn.Module):
 # Model
 # ------------------------------------------------------------------------------
 class FeedbackMicroVLA(nn.Module):
-    """MicroVLA where block 0's FFN weight set is chosen from h_{t-1} via MLP + Gumbel-softmax."""
+    """MicroVLA where block 0's FFN is controlled by h_{t-1}:
+    - gate_mode='mix':    signed 2D linear combination g = tanh(MLP(h_{t-1})) in [-1, 1]^2 of FFN_A and FFN_B
+    - gate_mode='switch': discrete selection of weight set A or B via Gumbel-softmax
+    """
 
     def __init__(
         self,
@@ -120,9 +134,12 @@ class FeedbackMicroVLA(nn.Module):
         n_layers: int = 3,
         n_heads: int = 4,
         gate_hidden: int = 51,  # 51 makes the param count exactly match micro_vla_sequential.py
+        gate_mode: str = "mix",
     ):
         super().__init__()
+        assert gate_mode in ("mix", "switch"), f"Unknown gate_mode: {gate_mode}"
         self.d_model = d_model
+        self.gate_mode = gate_mode
         self.patch_embed = MicroPatchEmbed(IMG_SIZE, PATCH_SIZE, d_model)
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.token_pos_emb = nn.Parameter(torch.randn(1, 8, d_model) * 0.02)
@@ -140,13 +157,19 @@ class FeedbackMicroVLA(nn.Module):
             nn.GELU(),
             nn.Linear(gate_hidden, NUM_CHOICES),
         )
+        if gate_mode == "mix":
+            with torch.no_grad():
+                self.gate_mlp[-1].bias.add_(0.8)  # start both branches active (tanh(0.8) ~ 0.66)
 
     def initial_feedback(self, batch_size: int) -> torch.Tensor:
         return self.h_init.unsqueeze(0).expand(batch_size, -1)
 
     def gate(self, h_prev: torch.Tensor, tau: float = 1.0, hard: bool = True):
-        """Return (g [B,K] used for routing, p [B,K] noise-free routing probabilities)."""
+        """Return (g [B,K] used for routing/mixing, p [B,K] probabilities or signed weights)."""
         logits = self.gate_mlp(h_prev)
+        if self.gate_mode == "mix":
+            g = torch.tanh(logits)  # signed 2D basis weights in [-1, 1]^2
+            return g, g
         p = F.softmax(logits, dim=-1)
         if self.training:
             g = F.gumbel_softmax(logits, tau=tau, hard=hard)  # straight-through when hard
@@ -170,7 +193,7 @@ class FeedbackMicroVLA(nn.Module):
         t_emb = self.token_embed(token_ids) + self.token_pos_emb[:, :seq_len, :]
         x = torch.cat([v_emb, t_emb], dim=1)
 
-        x = self.blocks[0](x, g)
+        x = self.blocks[0](x, g, mix_branches=(self.gate_mode == "mix"))
         for block in self.blocks[1:]:
             x = block(x)
         h = self.ln_f(x)
@@ -191,7 +214,7 @@ class FeedbackMicroVLA(nn.Module):
 
 
 # ------------------------------------------------------------------------------
-# Routing regularizers
+# Routing & mixing regularizers
 # ------------------------------------------------------------------------------
 def balance_loss(p: torch.Tensor) -> torch.Tensor:
     """log(K) - H(mean_b p_b) >= 0; zero iff the batch uses every weight set equally often."""
@@ -202,6 +225,13 @@ def balance_loss(p: torch.Tensor) -> torch.Tensor:
 def decisiveness_loss(p: torch.Tensor) -> torch.Tensor:
     """Mean per-sample routing entropy; low when each sample commits to one weight set."""
     return -(p * torch.log(p + 1e-9)).sum(-1).mean()
+
+
+def ortho_loss(g: torch.Tensor, target_var: float = 0.5) -> torch.Tensor:
+    """Encourage signed 2D basis weights g [B, 2] to be orthogonal and have equal second moment."""
+    gram = (g.T @ g) / max(1, g.size(0))
+    target = target_var * torch.eye(g.size(-1), device=g.device)
+    return (gram - target).pow(2).sum()
 
 
 # ------------------------------------------------------------------------------
@@ -247,6 +277,7 @@ def train_feedback_vla(
     tau_end: float = 0.5,
     balance_coef: float = 0.1,
     decisive_coef: float = 0.01,
+    ortho_coef: float = 0.05,
     detach_feedback: bool = False,
     batch_schedule=None,
     log_every: int = 65,
@@ -284,32 +315,42 @@ def train_feedback_vla(
         imgs, inps, tgts = ep_images[idx], ep_inputs[idx], ep_targets[idx]
 
         h = model.initial_feedback(idx.numel())
-        ce_total, bal_total, dec_total = 0.0, 0.0, 0.0
+        ce_total, bal_total, dec_total, ort_total = 0.0, 0.0, 0.0, 0.0
         usage = torch.zeros(NUM_CHOICES, device=device)
         for t in range(L):
             _, ce, h, info = model(imgs[:, t], inps[:, t], h, tgts[:, t], tau=tau, hard=hard)
             if detach_feedback:
                 h = h.detach()
             ce_total = ce_total + ce
-            bal_total = bal_total + balance_loss(info["p"])
-            dec_total = dec_total + decisiveness_loss(info["p"])
-            usage += info["g"].detach().sum(0)
+            if model.gate_mode == "mix":
+                if t >= 1:
+                    ort_total = ort_total + ortho_loss(info["g"])
+                usage += info["g"].detach().abs().mean(0)
+            else:
+                bal_total = bal_total + balance_loss(info["p"])
+                dec_total = dec_total + decisiveness_loss(info["p"])
+                usage += info["g"].detach().sum(0)
         ce_mean = ce_total / L
-        loss = ce_mean + balance_coef * bal_total / L + decisive_coef * dec_total / L
+        if model.gate_mode == "mix":
+            loss = ce_mean + ortho_coef * ort_total / max(1, L - 1)
+            usage = (usage / L).cpu().tolist()
+        else:
+            loss = ce_mean + balance_coef * bal_total / L + decisive_coef * dec_total / L
+            usage = (usage / usage.sum()).cpu().tolist()
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         grads = per_choice_grad_norm(model)
         optimizer.step()
 
-        usage = (usage / usage.sum()).cpu().tolist()
         history["loss"].append(float(ce_mean.item()))
         history["usage"].append(usage)
         history["grad"].append(grads)
         if log_every and (step % log_every == 0 or step == 1 or step == steps):
+            mode_str = "mix(|g|)" if model.gate_mode == "mix" else f"tau:{tau:.2f} {'hard' if hard else 'soft'}"
             print(
-                f"step {step:4d}/{steps} | ce: {ce_mean.item():.4f} | tau: {tau:.2f} "
-                f"{'hard' if hard else 'soft'} | usage A/B: {usage[0]:.2f}/{usage[1]:.2f} "
+                f"step {step:4d}/{steps} | ce: {ce_mean.item():.4f} | {mode_str} "
+                f"| A/B: {usage[0]:.2f}/{usage[1]:.2f} "
                 f"| grad A/B: {grads[0]:.3f}/{grads[1]:.3f} | {time.time() - t0:5.1f}s"
             )
 
@@ -326,16 +367,22 @@ def run_inference(
     steps: int = 15,
     env_state=None,
     hidden_steps=None,
+    target_velocities=None,
+    target_speed: float = 0.0,
 ):
-    """Closed-loop rollout; targets are not rendered at timesteps in `hidden_steps` (occlusion)."""
+    """Closed-loop rollout; targets are not rendered at timesteps in `hidden_steps` (occlusion)
+    and move along non-colliding lines when `target_velocities` or `target_speed > 0` is given."""
     hidden_steps = hidden_steps or set()
     model.eval()
     words = prompt.strip().lower().split()
     assert len(words) == 2 and words[0] == "reach" and words[1] in COLORS, prompt
     target_color = words[1]
-    gripper_pos, targets = (
+    gripper_pos, raw_targets = (
         sample_env_state() if env_state is None else (list(env_state[0]), env_state[1])
     )
+    targets = {c: list(p) for c, p in raw_targets.items()}
+    if target_velocities is None and target_speed > 0.0:
+        target_velocities = sample_target_velocities(targets, speed=target_speed, max_steps=steps)
     goal_pos = targets[target_color]
     prefix = [stoi["reach"], stoi[target_color], stoi["ACT_START"]]
     frames, trajectory, records = [], [list(gripper_pos)], []
@@ -366,6 +413,8 @@ def run_inference(
             max(2.0, min(29.0, gripper_pos[0] + dx * MAX_STEP_PX)),
             max(2.0, min(29.0, gripper_pos[1] + dy * MAX_STEP_PX)),
         ]
+        targets = step_targets(targets, target_velocities)
+        goal_pos = targets[target_color]
         dist = math.hypot(goal_pos[0] - gripper_pos[0], goal_pos[1] - gripper_pos[1])
         trajectory.append(list(gripper_pos))
         records.append(
@@ -400,10 +449,13 @@ if __name__ == "__main__":
     OCCLUSION_PROB = 0.7
     print(
         f"Generating synthetic expert demonstrations (250 episodes x 10 steps x 3 prompts, "
-        f"occlusion_prob={OCCLUSION_PROB})..."
+        f"occlusion_prob={OCCLUSION_PROB}, target_speed={TARGET_SPEED})..."
     )
     images, input_seqs, target_seqs = generate_vla_dataset(
-        num_episodes=250, episode_len=EPISODE_LEN, occlusion_prob=OCCLUSION_PROB
+        num_episodes=250,
+        episode_len=EPISODE_LEN,
+        occlusion_prob=OCCLUSION_PROB,
+        target_speed=TARGET_SPEED,
     )
     ep_images, ep_inputs, ep_targets = to_episodes(images, input_seqs, target_seqs, EPISODE_LEN)
 
@@ -415,7 +467,7 @@ if __name__ == "__main__":
     )
 
     print(f"\n--- Training FeedbackMicroVLA on {DEVICE} (full-episode BPTT) ---")
-    history = train_feedback_vla(model, ep_images, ep_inputs, ep_targets, steps=520)
+    history = train_feedback_vla(model, ep_images, ep_inputs, ep_targets, steps=2080)
 
     # Verify both weight sets actually learned: distance moved from init, per set
     moved = torch.zeros(NUM_CHOICES)
@@ -431,10 +483,16 @@ if __name__ == "__main__":
         print("WARNING: one weight set barely trained (routing collapse).")
 
     eval_env_state = sample_env_state()
+    eval_vels = sample_target_velocities(eval_env_state[1], speed=TARGET_SPEED, max_steps=15)
     eval_hidden = {"blue": {3, 4, 5}, "red": {5, 6, 7}, "green": {2, 3, 4}}
     rollouts = [
         run_inference(
-            model, prompt=f"reach {c}", steps=15, env_state=eval_env_state, hidden_steps=eval_hidden
+            model,
+            prompt=f"reach {c}",
+            steps=15,
+            env_state=eval_env_state,
+            hidden_steps=eval_hidden,
+            target_velocities=eval_vels,
         )
         for c in ["blue", "red", "green"]
     ]

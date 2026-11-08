@@ -25,6 +25,7 @@ import torch.nn as nn
 
 from micro_vla import (
     DEVICE,
+    TARGET_SPEED,
     VOCAB_SIZE,
     NUM_PATCHES,
     CausalSelfAttention,
@@ -33,6 +34,7 @@ from micro_vla import (
     print_ascii_rollout,
     run_inference,
     sample_env_state,
+    sample_target_velocities,
     save_demo_gif,
 )
 from micro_vla_feedback import to_episodes
@@ -134,10 +136,13 @@ if __name__ == "__main__":
     OCCLUSION_PROB = 0.7
     print(
         f"Generating synthetic expert demonstrations (250 episodes x 10 steps x 3 prompts, "
-        f"occlusion_prob={OCCLUSION_PROB})..."
+        f"occlusion_prob={OCCLUSION_PROB}, target_speed={TARGET_SPEED})..."
     )
     images, input_seqs, target_seqs = generate_vla_dataset(
-        num_episodes=250, episode_len=EPISODE_LEN, occlusion_prob=OCCLUSION_PROB
+        num_episodes=250,
+        episode_len=EPISODE_LEN,
+        occlusion_prob=OCCLUSION_PROB,
+        target_speed=TARGET_SPEED,
     )
     ep_images, ep_inputs, ep_targets = to_episodes(images, input_seqs, target_seqs, EPISODE_LEN)
 
@@ -148,13 +153,19 @@ if __name__ == "__main__":
     )
 
     print(f"\n--- Training SequentialMicroVLA on {DEVICE} (same episode batches as feedback model) ---")
-    loss_history = train_sequential_episodes(model, ep_images, ep_inputs, ep_targets, steps=520)
+    loss_history = train_sequential_episodes(model, ep_images, ep_inputs, ep_targets, steps=2080)
 
     eval_env_state = sample_env_state()
+    eval_vels = sample_target_velocities(eval_env_state[1], speed=TARGET_SPEED, max_steps=15)
     eval_hidden = {"blue": {3, 4, 5}, "red": {5, 6, 7}, "green": {2, 3, 4}}
     rollouts = [
         run_inference(
-            model, prompt=f"reach {c}", steps=15, env_state=eval_env_state, hidden_steps=eval_hidden
+            model,
+            prompt=f"reach {c}",
+            steps=15,
+            env_state=eval_env_state,
+            hidden_steps=eval_hidden,
+            target_velocities=eval_vels,
         )
         for c in ["blue", "red", "green"]
     ]

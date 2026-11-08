@@ -80,6 +80,8 @@ IMG_SIZE = 32
 PATCH_SIZE = 4
 NUM_PATCHES = (IMG_SIZE // PATCH_SIZE) ** 2  # 8 x 8 = 64 visual patches
 MAX_STEP_PX = 2.2  # pixels moved per unit action (1.0)
+TARGET_SPEED = 0.7  # slow target motion (px/step) along straight lines (< MAX_STEP_PX)
+MIN_TARGET_DIST = 6.0  # minimum center-to-center distance (px) so 3x3 targets never collide
 
 COLORS = {
     "red": torch.tensor([1.0, 0.0, 0.0]),
@@ -170,10 +172,72 @@ def sample_env_state():
     return gripper_pos, targets
 
 
+def _segments_min_dist(p1, v1, p2, v2, max_steps: int) -> float:
+    """Exact minimum Euclidean distance between two linearly moving points on t in [0, max_steps]."""
+    dpx, dpy = p1[0] - p2[0], p1[1] - p2[1]
+    dvx, dvy = v1[0] - v2[0], v1[1] - v2[1]
+    vv = dvx * dvx + dvy * dvy
+    t_star = 0.0 if vv < 1e-12 else max(0.0, min(float(max_steps), -(dpx * dvx + dpy * dvy) / vv))
+    return math.hypot(dpx + t_star * dvx, dpy + t_star * dvy)
+
+
+def sample_target_velocities(
+    targets: dict,
+    speed: float = TARGET_SPEED,
+    max_steps: int = 15,
+    min_dist: float = MIN_TARGET_DIST,
+    margin: float = 3.5,
+) -> dict:
+    """Sample constant 2D velocities so each target moves slowly along a straight line within bounds
+    and no two targets ever collide (continuous distance >= min_dist for all t in [0, max_steps])."""
+    if speed <= 0.0:
+        return {c: [0.0, 0.0] for c in COLORS}
+    lo, hi = margin, IMG_SIZE - 1 - margin
+    color_names = list(COLORS.keys())
+
+    def sample_in_bounds_vel(pos):
+        for _ in range(200):
+            angle = random.uniform(0.0, 2.0 * math.pi)
+            vx, vy = speed * math.cos(angle), speed * math.sin(angle)
+            ex, ey = pos[0] + max_steps * vx, pos[1] + max_steps * vy
+            if lo <= ex <= hi and lo <= ey <= hi:
+                return [vx, vy]
+        # Fallback: move toward workspace center
+        cx, cy = (IMG_SIZE - 1) / 2.0 - pos[0], (IMG_SIZE - 1) / 2.0 - pos[1]
+        norm = max(1e-6, math.hypot(cx, cy))
+        return [speed * cx / norm, speed * cy / norm]
+
+    for _ in range(500):
+        vels = {c: sample_in_bounds_vel(targets[c]) for c in color_names}
+        collision = False
+        for i in range(len(color_names)):
+            for j in range(i + 1, len(color_names)):
+                c1, c2 = color_names[i], color_names[j]
+                if _segments_min_dist(targets[c1], vels[c1], targets[c2], vels[c2], max_steps) < min_dist:
+                    collision = True
+                    break
+            if collision:
+                break
+        if not collision:
+            return vels
+    return {c: [0.0, 0.0] for c in color_names}
+
+
+def step_targets(targets: dict, velocities: dict = None) -> dict:
+    """Advance each target one step along its linear trajectory."""
+    if not velocities:
+        return {c: list(pos) for c, pos in targets.items()}
+    return {
+        c: [pos[0] + velocities[c][0], pos[1] + velocities[c][1]]
+        for c, pos in targets.items()
+    }
+
+
 def generate_vla_dataset(
     num_episodes: int = 500,
     episode_len: int = 15,
     occlusion_prob: float = 0.0,
+    target_speed: float = 0.0,
     return_hidden: bool = False,
 ):
     """
@@ -182,6 +246,7 @@ def generate_vla_dataset(
     each rendered state along a trajectory is paired with all 3 counterfactual language prompts.
     With probability `occlusion_prob` an episode gets a window of 2-4 frames in which the targets
     are not rendered; the expert still acts on the true target positions (requires memory).
+    When `target_speed > 0`, targets move slowly along non-colliding straight lines.
     Unified Sequence Structure per timestep:
       Input Sequence:  [PATCH_0 ... PATCH_63] | ["reach", <color>] | ["ACT_START"] | [ACT_X_BIN]
       Target Sequence: [   ... ignored ...  ] | [  ... ignored ... ] |  [ACT_X_BIN]  | [ACT_Y_BIN]
@@ -191,16 +256,19 @@ def generate_vla_dataset(
 
     for _ in range(num_episodes):
         gripper_pos, targets = sample_env_state()
+        velocities = sample_target_velocities(targets, speed=target_speed, max_steps=episode_len)
         nav_color = random.choice(color_names)
         hidden_by_color = sample_occlusion(episode_len, occlusion_prob)
 
         for t in range(episode_len):
             hidden_now = {c for c, ts in hidden_by_color.items() if t in ts}
             img = render_env(gripper_pos, targets, hidden_colors=hidden_now)
+            next_targets = step_targets(targets, velocities)
 
             # Supervise all 3 language instructions ("reach red/green/blue") on the same visual state
+            # Aim at the target's next position along its line so the expert tracks moving targets
             for target_color in color_names:
-                goal_pos = targets[target_color]
+                goal_pos = next_targets[target_color]
                 dx = max(-1.0, min(1.0, (goal_pos[0] - gripper_pos[0]) / MAX_STEP_PX))
                 dy = max(-1.0, min(1.0, (goal_pos[1] - gripper_pos[1]) / MAX_STEP_PX))
 
@@ -223,7 +291,7 @@ def generate_vla_dataset(
                 hidden_flags.append(t in hidden_by_color[target_color])
 
             # Step the environment along the active trajectory using the quantized action
-            nav_goal = targets[nav_color]
+            nav_goal = next_targets[nav_color]
             nav_dx = max(-1.0, min(1.0, (nav_goal[0] - gripper_pos[0]) / MAX_STEP_PX))
             nav_dy = max(-1.0, min(1.0, (nav_goal[1] - gripper_pos[1]) / MAX_STEP_PX))
             xb, yb = action_to_bin(nav_dx), action_to_bin(nav_dy)
@@ -231,6 +299,7 @@ def generate_vla_dataset(
                 max(2.0, min(29.0, gripper_pos[0] + bin_to_action(xb) * MAX_STEP_PX)),
                 max(2.0, min(29.0, gripper_pos[1] + bin_to_action(yb) * MAX_STEP_PX)),
             ]
+            targets = next_targets
 
     data = (
         torch.stack(images),  # [N, 32, 32, 3]
@@ -427,13 +496,16 @@ def run_inference(
     steps: int = 15,
     env_state=None,
     hidden_steps=None,
+    target_velocities=None,
+    target_speed: float = 0.0,
 ):
     """
     Closed-loop autoregressive rollout on an unseen environment state:
       1. Feed 32x32 RGB image + ["reach", <color>, "ACT_START"] -> predict ACT_X_BIN -> delta_x
       2. Append ACT_X_BIN -> predict ACT_Y_BIN -> delta_y
       3. Step synthetic environment and repeat for `steps` timesteps.
-    Targets are not rendered at timesteps in `hidden_steps` (occlusion).
+    Targets are not rendered at timesteps in `hidden_steps` (occlusion) and move along
+    non-colliding straight lines when `target_velocities` or `target_speed > 0` is provided.
     """
     hidden_steps = hidden_steps or set()
     model.eval()
@@ -443,9 +515,12 @@ def run_inference(
     ), f"Unsupported prompt: {prompt}"
     target_color = words[1]
 
-    gripper_pos, targets = (
+    gripper_pos, raw_targets = (
         sample_env_state() if env_state is None else (list(env_state[0]), env_state[1])
     )
+    targets = {c: list(p) for c, p in raw_targets.items()}
+    if target_velocities is None and target_speed > 0.0:
+        target_velocities = sample_target_velocities(targets, speed=target_speed, max_steps=steps)
     goal_pos = targets[target_color]
     prompt_prefix = [stoi["reach"], stoi[target_color], stoi["ACT_START"]]
 
@@ -477,11 +552,13 @@ def run_inference(
         act_y_tok = Y_OFFSET + y_bin
         dy = bin_to_action(y_bin)
 
-        # Step 3: Advance the continuous 2D environment
+        # Step 3: Advance the continuous 2D environment (gripper + moving targets)
         gripper_pos = [
             max(2.0, min(29.0, gripper_pos[0] + dx * MAX_STEP_PX)),
             max(2.0, min(29.0, gripper_pos[1] + dy * MAX_STEP_PX)),
         ]
+        targets = step_targets(targets, target_velocities)
+        goal_pos = targets[target_color]
         dist = math.hypot(goal_pos[0] - gripper_pos[0], goal_pos[1] - gripper_pos[1])
         trajectory.append(list(gripper_pos))
         step_records.append(
