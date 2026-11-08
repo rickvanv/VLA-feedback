@@ -125,8 +125,14 @@ def train_sequential_episodes(
 if __name__ == "__main__":
     t_start = time.time()
     EPISODE_LEN = 10
-    print("Generating synthetic expert demonstrations (250 episodes x 10 steps x 3 prompts)...")
-    images, input_seqs, target_seqs = generate_vla_dataset(num_episodes=250, episode_len=EPISODE_LEN)
+    OCCLUSION_PROB = 0.7
+    print(
+        f"Generating synthetic expert demonstrations (250 episodes x 10 steps x 3 prompts, "
+        f"occlusion_prob={OCCLUSION_PROB})..."
+    )
+    images, input_seqs, target_seqs = generate_vla_dataset(
+        num_episodes=250, episode_len=EPISODE_LEN, occlusion_prob=OCCLUSION_PROB
+    )
     ep_images, ep_inputs, ep_targets = to_episodes(images, input_seqs, target_seqs, EPISODE_LEN)
 
     model = SequentialMicroVLA(vocab_size=VOCAB_SIZE, d_model=64, n_layers=3, n_heads=4)
@@ -139,8 +145,11 @@ if __name__ == "__main__":
     loss_history = train_sequential_episodes(model, ep_images, ep_inputs, ep_targets, steps=520)
 
     eval_env_state = sample_env_state()
+    eval_hidden = {"blue": {3, 4, 5}, "red": {5, 6, 7}, "green": {2, 3, 4}}
     rollouts = [
-        run_inference(model, prompt=f"reach {c}", steps=15, env_state=eval_env_state)
+        run_inference(
+            model, prompt=f"reach {c}", steps=15, env_state=eval_env_state, hidden_steps=eval_hidden
+        )
         for c in ["blue", "red", "green"]
     ]
     for r in rollouts:

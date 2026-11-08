@@ -96,9 +96,10 @@ TARGET_SLOTS = [
 ]
 
 
-def render_env(gripper_pos, targets, show_targets: bool = True) -> torch.Tensor:
+def render_env(gripper_pos, targets, hidden_colors=None) -> torch.Tensor:
     """Render a 32x32x3 RGB float tensor with 3x3 colored target dots and a 3x3 white gripper.
-    With show_targets=False the targets are occluded (only the gripper is drawn)."""
+    Any target color listed in `hidden_colors` is occluded (not drawn) for this frame."""
+    hidden_colors = hidden_colors or ()
     img = torch.zeros(IMG_SIZE, IMG_SIZE, 3, dtype=torch.float32)
 
     def draw_square(pos, color, radius=1):
@@ -107,21 +108,48 @@ def render_env(gripper_pos, targets, show_targets: bool = True) -> torch.Tensor:
         y0, y1 = max(0, cy - radius), min(IMG_SIZE, cy + radius + 1)
         img[y0:y1, x0:x1] = color
 
-    if show_targets:
-        for color_name, t_pos in targets.items():
+    for color_name, t_pos in targets.items():
+        if color_name not in hidden_colors:
             draw_square(t_pos, COLORS[color_name], radius=1)
     draw_square(gripper_pos, GRIPPER_COLOR, radius=1)
     return img
 
 
-def sample_occlusion(
+def sample_occlusion_window(
     episode_len: int, min_len: int = 2, max_len: int = 4, first_visible: int = 2
 ) -> set:
-    """Pick one window of consecutive timesteps during which all targets are invisible.
-    The first `first_visible` frames always show the targets so they can be memorized."""
+    """Pick one window of consecutive timesteps during which a target is invisible.
+    The first `first_visible` frames always show the target so it can be memorized."""
     length = random.randint(min_len, max_len)
     start = random.randint(first_visible, max(first_visible, episode_len - length))
     return set(range(start, min(episode_len, start + length)))
+
+
+def sample_occlusion(
+    episode_len: int,
+    occlusion_prob: float = 0.7,
+    min_len: int = 2,
+    max_len: int = 4,
+    first_visible: int = 2,
+) -> dict:
+    """Sample independent occlusion windows per target color: {color: set_of_timesteps}."""
+    return {
+        c: (
+            sample_occlusion_window(episode_len, min_len, max_len, first_visible)
+            if occlusion_prob > 0 and random.random() < occlusion_prob
+            else set()
+        )
+        for c in COLORS
+    }
+
+
+def hidden_colors_at(hidden_steps, t: int, target_color: str) -> set:
+    """Resolve which target colors are hidden at step `t` from a dict {color: set} or a set of steps."""
+    if not hidden_steps:
+        return set()
+    if isinstance(hidden_steps, dict):
+        return {c for c, ts in hidden_steps.items() if t in ts}
+    return {target_color} if t in hidden_steps else set()
 
 
 def sample_env_state():
@@ -159,14 +187,11 @@ def generate_vla_dataset(
     for _ in range(num_episodes):
         gripper_pos, targets = sample_env_state()
         nav_color = random.choice(color_names)
-        hidden = (
-            sample_occlusion(episode_len)
-            if occlusion_prob > 0 and random.random() < occlusion_prob
-            else set()
-        )
+        hidden_by_color = sample_occlusion(episode_len, occlusion_prob)
 
         for t in range(episode_len):
-            img = render_env(gripper_pos, targets, show_targets=t not in hidden)
+            hidden_now = {c for c, ts in hidden_by_color.items() if t in ts}
+            img = render_env(gripper_pos, targets, hidden_colors=hidden_now)
 
             # Supervise all 3 language instructions ("reach red/green/blue") on the same visual state
             for target_color in color_names:
@@ -190,7 +215,7 @@ def generate_vla_dataset(
                 images.append(img)
                 input_seqs.append(seq_in)
                 target_seqs.append(seq_tgt)
-                hidden_flags.append(t in hidden)
+                hidden_flags.append(t in hidden_by_color[target_color])
 
             # Step the environment along the active trajectory using the quantized action
             nav_goal = targets[nav_color]
@@ -417,7 +442,9 @@ def run_inference(
     frames, trajectory, step_records = [], [list(gripper_pos)], []
 
     for t in range(steps):
-        img = render_env(gripper_pos, targets, show_targets=t not in hidden_steps)
+        img = render_env(
+            gripper_pos, targets, hidden_colors=hidden_colors_at(hidden_steps, t, target_color)
+        )
         frames.append(img)
         img_batch = img.unsqueeze(0)  # [1, 32, 32, 3]
 

@@ -81,8 +81,9 @@ def closed_loop(run_fn, model, env_states, hidden_windows):
             d = r["records"][-1]["dist"]
             final.append(d)
             success.append(float(d < SUCCESS_PX))
-            if hidden:  # distance to goal right after the last occluded action
-                after_occ.append(r["records"][max(hidden)]["dist"])
+            occ_c = hidden[c] if isinstance(hidden, dict) else hidden
+            if occ_c:  # distance to goal right after the last occluded action for target c
+                after_occ.append(r["records"][max(occ_c)]["dist"])
     return {
         "final_dist_px": statistics.mean(final),
         "success_rate": statistics.mean(success),
@@ -117,7 +118,7 @@ if __name__ == "__main__":
         va_hidden = va_hidden.view(-1, EPISODE_LEN, 3).transpose(1, 2).reshape(-1, EPISODE_LEN)
         env_states = [sample_env_state() for _ in range(NUM_EVAL_STATES)]
         hidden_windows = [
-            sample_occlusion(EPISODE_LEN) if random.random() < args.occlusion_prob else set()
+            sample_occlusion(EPISODE_LEN, args.occlusion_prob)
             for _ in range(NUM_EVAL_STATES)
         ]
         num_episodes = tr[0].size(0) // 3

@@ -56,6 +56,7 @@ from micro_vla import (
     TransformerBlock,
     bin_to_action,
     generate_vla_dataset,
+    hidden_colors_at,
     itos,
     print_ascii_rollout,
     render_env,
@@ -334,7 +335,9 @@ def run_inference(
     h = model.initial_feedback(1)
 
     for t in range(steps):
-        img = render_env(gripper_pos, targets, show_targets=t not in hidden_steps)
+        img = render_env(
+            gripper_pos, targets, hidden_colors=hidden_colors_at(hidden_steps, t, target_color)
+        )
         frames.append(img)
         img_b = img.unsqueeze(0)
 
@@ -386,8 +389,14 @@ def run_inference(
 if __name__ == "__main__":
     t_start = time.time()
     EPISODE_LEN = 10
-    print("Generating synthetic expert demonstrations (250 episodes x 10 steps x 3 prompts)...")
-    images, input_seqs, target_seqs = generate_vla_dataset(num_episodes=250, episode_len=EPISODE_LEN)
+    OCCLUSION_PROB = 0.7
+    print(
+        f"Generating synthetic expert demonstrations (250 episodes x 10 steps x 3 prompts, "
+        f"occlusion_prob={OCCLUSION_PROB})..."
+    )
+    images, input_seqs, target_seqs = generate_vla_dataset(
+        num_episodes=250, episode_len=EPISODE_LEN, occlusion_prob=OCCLUSION_PROB
+    )
     ep_images, ep_inputs, ep_targets = to_episodes(images, input_seqs, target_seqs, EPISODE_LEN)
 
     model = FeedbackMicroVLA(vocab_size=VOCAB_SIZE, d_model=64, n_layers=3, n_heads=4)
@@ -411,8 +420,11 @@ if __name__ == "__main__":
         print("WARNING: one weight set barely trained (routing collapse).")
 
     eval_env_state = sample_env_state()
+    eval_hidden = {"blue": {3, 4, 5}, "red": {5, 6, 7}, "green": {2, 3, 4}}
     rollouts = [
-        run_inference(model, prompt=f"reach {c}", steps=15, env_state=eval_env_state)
+        run_inference(
+            model, prompt=f"reach {c}", steps=15, env_state=eval_env_state, hidden_steps=eval_hidden
+        )
         for c in ["blue", "red", "green"]
     ]
     for r in rollouts:
