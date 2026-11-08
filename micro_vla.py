@@ -19,7 +19,7 @@ import torch.nn.functional as F
 # ==============================================================================
 
 # Let there be reproducibility and fast multi-threaded CPU execution
-SEED = 42
+SEED = 24
 torch.set_num_threads(6)
 random.seed(SEED)
 torch.manual_seed(SEED)
