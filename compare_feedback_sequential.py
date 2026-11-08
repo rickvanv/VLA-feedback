@@ -12,7 +12,7 @@ and are evaluated on validation cross-entropy and closed-loop rollouts, plus an 
 (`micro_vla_demo_moving_overlay.gif`) overlaying the trajectories of all variants on the same
 moving-target episodes.
 
-Usage: uv run python compare_feedback_sequential.py --occlusion-prob 0.0 --target-speed 0.7 --seeds 0 1 2 --steps 520
+Usage: uv run python compare_feedback_sequential.py --occlusion-prob 0.0 --target-speed 0.7 --seeds 0 1 2 --steps 2000
 """
 
 import argparse
@@ -412,8 +412,11 @@ def save_overlay_gif(
         if i == 0:
             ax.legend(loc="upper right", fontsize=6.5, facecolor="#0d1117", edgecolor="#30363d", labelcolor="#e6edf3")
 
+    has_occl = bool(hidden_steps and any(len(v) > 0 for v in hidden_steps.values()))
+    occl_label = "With Occlusion" if has_occl else "No Occlusion"
     fig.suptitle(
-        "Moving Targets (No Occlusion) — Overlaid Trajectories: Feedback (Mix) vs Feedback (Switch) vs Sequential",
+        f"Moving Targets ({occl_label}, {len( next(iter(loss_histories.values())) )} Steps) — "
+        "Overlaid Trajectories: Feedback (Mix) vs Feedback (Switch) vs Sequential",
         color="#f0f6fc",
         fontsize=11.5,
         fontweight="bold",
@@ -480,7 +483,7 @@ if __name__ == "__main__":
         help=f"Linear target speed in px/step (default: {TARGET_SPEED})",
     )
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    ap.add_argument("--steps", type=int, default=520)
+    ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--gif-path", type=str, default="micro_vla_demo_moving_overlay.gif")
     args = ap.parse_args()
 
