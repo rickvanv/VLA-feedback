@@ -6,18 +6,15 @@ For each seed, both models get:
   - exactly the same sequence of episode batches (shared batch schedule)
   - the same optimizer, LR schedule and number of updates
 and are then evaluated on:
-  - validation cross-entropy, split into frames where targets are VISIBLE vs OCCLUDED
+  - validation cross-entropy, split into frames where the queried target is VISIBLE vs OCCLUDED
     (feedback model unrolled over full episodes with deterministic gate)
   - closed-loop rollouts on the same random env states and occlusion windows for all 3 prompts
 
-Occlusion task (--occlusion-prob > 0): in a fraction of episodes, all targets disappear for 2-4
-consecutive frames (never in the first 2 frames). The expert keeps acting on the true target
-position, so predicting the right action during occlusion requires memory of earlier frames.
-
-Usage: python compare_feedback_sequential.py --occlusion-prob 0.7 --seeds 0 1 2 --steps 520
+Usage: python compare_feedback_sequential.py --occlusion-prob 0.7 --seeds 0 1 2 --steps 2080
 """
 
 import argparse
+import math
 import random
 import statistics
 import time
@@ -25,14 +22,22 @@ import torch
 import torch.nn.functional as F
 
 from micro_vla import (
+    DEVICE,
+    MAX_STEP_PX,
+    NUM_BINS,
     NUM_PATCHES,
     VOCAB_SIZE,
+    X_OFFSET,
+    Y_OFFSET,
+    bin_to_action,
     generate_vla_dataset,
-    run_inference as run_inference_seq,
+    hidden_colors_at,
+    render_env,
     sample_env_state,
     sample_occlusion,
+    stoi,
 )
-from micro_vla_feedback import FeedbackMicroVLA, run_inference as run_inference_fb, to_episodes, train_feedback_vla
+from micro_vla_feedback import FeedbackMicroVLA, to_episodes, train_feedback_vla
 from micro_vla_sequential import SequentialMicroVLA, train_sequential_episodes
 
 EPISODE_LEN = 10
@@ -73,17 +78,64 @@ def val_ce_sequential(model, ep_images, ep_inputs, ep_targets):
     return per_sample_ce(logits, ep_targets.flatten(0, 1)).view(S, L)
 
 
-def closed_loop(run_fn, model, env_states, hidden_windows):
-    final, success, after_occ = [], [], []
-    for state, hidden in zip(env_states, hidden_windows):
-        for c in ["red", "green", "blue"]:
-            r = run_fn(model, prompt=f"reach {c}", steps=ROLLOUT_STEPS, env_state=state, hidden_steps=hidden)
-            d = r["records"][-1]["dist"]
-            final.append(d)
-            success.append(float(d < SUCCESS_PX))
-            occ_c = hidden[c] if isinstance(hidden, dict) else hidden
-            if occ_c:  # distance to goal right after the last occluded action for target c
-                after_occ.append(r["records"][max(occ_c)]["dist"])
+@torch.no_grad()
+def closed_loop(model, env_states, hidden_windows, is_feedback: bool):
+    """Run all (NUM_EVAL_STATES x 3 prompts) closed-loop rollouts in a single GPU batch."""
+    model.eval()
+    dev = next(model.parameters()).device
+    colors = ["red", "green", "blue"]
+    M = len(env_states) * len(colors)
+    grippers = [list(s[0]) for s in env_states for _ in colors]
+    targets_list = [s[1] for s in env_states for _ in colors]
+    hiddens = [h for h in hidden_windows for _ in colors]
+    target_colors = [c for _ in env_states for c in colors]
+    goals = [t[c] for t, c in zip(targets_list, target_colors)]
+    prefixes = torch.tensor(
+        [[stoi["reach"], stoi[c], stoi["ACT_START"]] for c in target_colors],
+        dtype=torch.long,
+        device=dev,
+    )
+    h = model.initial_feedback(M) if is_feedback else None
+    dists_per_step = []
+
+    for t in range(ROLLOUT_STEPS):
+        imgs = torch.stack(
+            [
+                render_env(g, tgts, hidden_colors=hidden_colors_at(hid, t, tc))
+                for g, tgts, hid, tc in zip(grippers, targets_list, hiddens, target_colors)
+            ]
+        ).to(dev)
+        if is_feedback:
+            logits_x, _, h_next, _ = model(imgs, prefixes, h)
+        else:
+            logits_x, _ = model(imgs, prefixes)
+        x_bins = logits_x[:, -1, X_OFFSET : X_OFFSET + NUM_BINS].argmax(dim=-1)
+        act_x_toks = (X_OFFSET + x_bins).unsqueeze(1)
+        inp_y = torch.cat([prefixes, act_x_toks], dim=1)
+        if is_feedback:
+            logits_y, _, _, _ = model(imgs, inp_y, h)
+            h = h_next
+        else:
+            logits_y, _ = model(imgs, inp_y)
+        y_bins = logits_y[:, -1, Y_OFFSET : Y_OFFSET + NUM_BINS].argmax(dim=-1)
+
+        step_dists = []
+        for i, (xb, yb) in enumerate(zip(x_bins.cpu().tolist(), y_bins.cpu().tolist())):
+            dx, dy = bin_to_action(xb), bin_to_action(yb)
+            grippers[i] = [
+                max(2.0, min(29.0, grippers[i][0] + dx * MAX_STEP_PX)),
+                max(2.0, min(29.0, grippers[i][1] + dy * MAX_STEP_PX)),
+            ]
+            step_dists.append(math.hypot(goals[i][0] - grippers[i][0], goals[i][1] - grippers[i][1]))
+        dists_per_step.append(step_dists)
+
+    final = dists_per_step[-1]
+    success = [float(d < SUCCESS_PX) for d in final]
+    after_occ = [
+        dists_per_step[max(hid[tc])][i]
+        for i, (hid, tc) in enumerate(zip(hiddens, target_colors))
+        if hid[tc]
+    ]
     return {
         "final_dist_px": statistics.mean(final),
         "success_rate": statistics.mean(success),
@@ -104,33 +156,41 @@ if __name__ == "__main__":
 
     t_start = time.time()
     results = {"feedback": {}, "sequential": {}}
-    print(f"Occlusion probability per episode: {args.occlusion_prob} | steps: {args.steps} | seeds: {args.seeds}")
+    print(
+        f"Device: {DEVICE} | Occlusion prob: {args.occlusion_prob} | "
+        f"steps: {args.steps} | seeds: {args.seeds}"
+    )
 
     for seed in args.seeds:
         print(f"\n================ seed {seed} ================")
         seed_all(seed)
         tr = generate_vla_dataset(250, EPISODE_LEN, occlusion_prob=args.occlusion_prob)
-        tr = to_episodes(*tr, EPISODE_LEN)
+        tr = tuple(x.to(DEVICE) for x in to_episodes(*tr, EPISODE_LEN))
         *va, va_hidden = generate_vla_dataset(
             50, EPISODE_LEN, occlusion_prob=args.occlusion_prob, return_hidden=True
         )
-        va = to_episodes(*va, EPISODE_LEN)
-        va_hidden = va_hidden.view(-1, EPISODE_LEN, 3).transpose(1, 2).reshape(-1, EPISODE_LEN)
+        va = tuple(x.to(DEVICE) for x in to_episodes(*va, EPISODE_LEN))
+        va_hidden = (
+            va_hidden.view(-1, EPISODE_LEN, 3).transpose(1, 2).reshape(-1, EPISODE_LEN).to(DEVICE)
+        )
         env_states = [sample_env_state() for _ in range(NUM_EVAL_STATES)]
         hidden_windows = [
             sample_occlusion(EPISODE_LEN, args.occlusion_prob)
             for _ in range(NUM_EVAL_STATES)
         ]
         num_episodes = tr[0].size(0) // 3
-        schedule = [torch.randint(0, num_episodes, (EPS_PER_BATCH,)) for _ in range(args.steps)]
+        schedule = [
+            torch.randint(0, num_episodes, (EPS_PER_BATCH,), device=DEVICE)
+            for _ in range(args.steps)
+        ]
 
         runs = {
-            "feedback": (FeedbackMicroVLA, train_feedback_vla, val_ce_feedback, run_inference_fb),
-            "sequential": (SequentialMicroVLA, train_sequential_episodes, val_ce_sequential, run_inference_seq),
+            "feedback": (FeedbackMicroVLA, train_feedback_vla, val_ce_feedback, True),
+            "sequential": (SequentialMicroVLA, train_sequential_episodes, val_ce_sequential, False),
         }
-        for name, (Model, train_fn, val_fn, infer_fn) in runs.items():
+        for name, (Model, train_fn, val_fn, is_fb) in runs.items():
             seed_all(seed)  # same init RNG state for both models
-            model = Model(vocab_size=VOCAB_SIZE)
+            model = Model(vocab_size=VOCAB_SIZE).to(DEVICE)
             t0 = time.time()
             out = train_fn(model, *tr, steps=args.steps, batch_schedule=schedule, log_every=0)
             train_loss = out["loss"] if isinstance(out, dict) else out
@@ -138,16 +198,16 @@ if __name__ == "__main__":
             ce = val_fn(model, *va)
             metrics = {
                 "train_ce(last 20)": statistics.mean(train_loss[-20:]),
-                "val_ce_visible": float(ce[~va_hidden].mean()),
-                "val_ce_occluded": float(ce[va_hidden].mean()) if va_hidden.any() else float("nan"),
+                "val_ce_visible": float(ce[~va_hidden].mean().item()),
+                "val_ce_occluded": float(ce[va_hidden].mean().item()) if va_hidden.any() else float("nan"),
             }
-            metrics.update(closed_loop(infer_fn, model, env_states, hidden_windows))
+            metrics.update(closed_loop(model, env_states, hidden_windows, is_feedback=is_fb))
             for k, v in metrics.items():
                 results[name].setdefault(k, []).append(v)
             print(
                 f"{name:10s} | params {sum(p.numel() for p in model.parameters()):,} | "
                 + " | ".join(f"{k} {v:.3f}" for k, v in metrics.items())
-                + f" | {time.time() - t0:.0f}s"
+                + f" | {time.time() - t0:.1f}s"
             )
 
     print(f"\n=============== summary over seeds {args.seeds} (mean ± std) ===============")
@@ -155,4 +215,4 @@ if __name__ == "__main__":
     for k in results["feedback"]:
         print(f"{k:20s} | {fmt(results['feedback'][k]):>16s} | {fmt(results['sequential'][k]):>16s}")
     print(f"(success = final distance < {SUCCESS_PX}px over {NUM_EVAL_STATES} states x 3 prompts)")
-    print(f"Total runtime: {time.time() - t_start:.0f}s")
+    print(f"Total runtime: {time.time() - t_start:.1f}s")

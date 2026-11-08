@@ -18,8 +18,13 @@ import torch.nn.functional as F
 # PART I: CORE VISION-LANGUAGE-ACTION (VLA) ALGORITHM (<= 400 LINES)
 # ==============================================================================
 
-# Let there be reproducibility and fast multi-threaded CPU execution
+# Let there be reproducibility and hardware acceleration (Apple Silicon MPS / CUDA / CPU)
 SEED = 24
+DEVICE = torch.device(
+    "mps"
+    if torch.backends.mps.is_available()
+    else ("cuda" if torch.cuda.is_available() else "cpu")
+)
 torch.set_num_threads(6)
 random.seed(SEED)
 torch.manual_seed(SEED)
@@ -374,8 +379,13 @@ def train_vla(
     steps: int = 520,
     batch_size: int = 72,
     lr: float = 4e-3,
+    device: torch.device = DEVICE,
 ):
     """Train MicroVLA with AdamW and cross-entropy loss over discretized action tokens."""
+    model.to(device)
+    images = images.to(device)
+    input_seqs = input_seqs.to(device)
+    target_seqs = target_seqs.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
     num_states = images.size(0) // 3
     states_per_batch = batch_size // 3
@@ -391,7 +401,7 @@ def train_vla(
                 pg["lr"] = lr * max(0.1, 1.0 - 0.9 * frac)
 
         # Sample random visual states and include all 3 counterfactual prompts per state
-        state_idx = torch.randint(0, num_states, (states_per_batch,)) * 3
+        state_idx = torch.randint(0, num_states, (states_per_batch,), device=device) * 3
         idx = torch.cat([state_idx, state_idx + 1, state_idx + 2])
         _, loss = model(images[idx], input_seqs[idx], target_seqs[idx])
 
@@ -440,16 +450,17 @@ def run_inference(
     prompt_prefix = [stoi["reach"], stoi[target_color], stoi["ACT_START"]]
 
     frames, trajectory, step_records = [], [list(gripper_pos)], []
+    dev = next(model.parameters()).device
 
     for t in range(steps):
         img = render_env(
             gripper_pos, targets, hidden_colors=hidden_colors_at(hidden_steps, t, target_color)
         )
         frames.append(img)
-        img_batch = img.unsqueeze(0)  # [1, 32, 32, 3]
+        img_batch = img.unsqueeze(0).to(dev)  # [1, 32, 32, 3]
 
         # Step 1: Autoregressively predict ACT_X_BIN from [PATCH_0..63, "reach", color, "ACT_START"]
-        inp_x = torch.tensor([prompt_prefix], dtype=torch.long)
+        inp_x = torch.tensor([prompt_prefix], dtype=torch.long, device=dev)
         logits_x, _ = model(img_batch, inp_x)
         x_logits = logits_x[0, -1, X_OFFSET : X_OFFSET + NUM_BINS]
         x_probs = F.softmax(x_logits, dim=-1)
@@ -458,7 +469,7 @@ def run_inference(
         dx = bin_to_action(x_bin)
 
         # Step 2: Append ACT_X_BIN and autoregressively predict ACT_Y_BIN
-        inp_y = torch.tensor([prompt_prefix + [act_x_tok]], dtype=torch.long)
+        inp_y = torch.tensor([prompt_prefix + [act_x_tok]], dtype=torch.long, device=dev)
         logits_y, _ = model(img_batch, inp_y)
         y_logits = logits_y[0, -1, Y_OFFSET : Y_OFFSET + NUM_BINS]
         y_probs = F.softmax(y_logits, dim=-1)

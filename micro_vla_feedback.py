@@ -43,6 +43,7 @@ import torch.nn.functional as F
 
 from micro_vla import (
     COLORS,
+    DEVICE,
     IMG_SIZE,
     MAX_STEP_PX,
     NUM_BINS,
@@ -226,11 +227,11 @@ def switched_params(model: FeedbackMicroVLA):
 
 def per_choice_grad_norm(model: FeedbackMicroVLA):
     """Gradient norm landing on each weight set k (proves both receive learning signal)."""
-    sq = torch.zeros(NUM_CHOICES)
+    sq = torch.zeros(NUM_CHOICES, device=model.h_init.device)
     for prm in switched_params(model):
         if prm.grad is not None:
             sq += prm.grad.flatten(1).pow(2).sum(1)
-    return sq.sqrt().tolist()
+    return sq.sqrt().cpu().tolist()
 
 
 def train_feedback_vla(
@@ -249,8 +250,13 @@ def train_feedback_vla(
     detach_feedback: bool = False,
     batch_schedule=None,
     log_every: int = 65,
+    device: torch.device = DEVICE,
 ):
     """batch_schedule: optional list of episode-index tensors (one per step) to share batches across models."""
+    model.to(device)
+    ep_images = ep_images.to(device)
+    ep_inputs = ep_inputs.to(device)
+    ep_targets = ep_targets.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
     num_episodes = ep_images.size(0) // 3
     eps_per_batch = max(1, streams_per_batch // 3)
@@ -271,14 +277,15 @@ def train_feedback_vla(
 
         # Sample whole episodes, keeping all 3 counterfactual prompt streams together
         if batch_schedule is not None:
-            ep_idx = batch_schedule[step - 1] * 3
+            ep_idx = batch_schedule[step - 1].to(device) * 3
         else:
-            ep_idx = torch.randint(0, num_episodes, (eps_per_batch,)) * 3
+            ep_idx = torch.randint(0, num_episodes, (eps_per_batch,), device=device) * 3
         idx = torch.cat([ep_idx, ep_idx + 1, ep_idx + 2])
         imgs, inps, tgts = ep_images[idx], ep_inputs[idx], ep_targets[idx]
 
         h = model.initial_feedback(idx.numel())
-        ce_total, bal_total, dec_total, usage = 0.0, 0.0, 0.0, torch.zeros(NUM_CHOICES)
+        ce_total, bal_total, dec_total = 0.0, 0.0, 0.0
+        usage = torch.zeros(NUM_CHOICES, device=device)
         for t in range(L):
             _, ce, h, info = model(imgs[:, t], inps[:, t], h, tgts[:, t], tau=tau, hard=hard)
             if detach_feedback:
@@ -295,7 +302,7 @@ def train_feedback_vla(
         grads = per_choice_grad_norm(model)
         optimizer.step()
 
-        usage = (usage / usage.sum()).tolist()
+        usage = (usage / usage.sum()).cpu().tolist()
         history["loss"].append(float(ce_mean.item()))
         history["usage"].append(usage)
         history["grad"].append(grads)
@@ -332,6 +339,7 @@ def run_inference(
     goal_pos = targets[target_color]
     prefix = [stoi["reach"], stoi[target_color], stoi["ACT_START"]]
     frames, trajectory, records = [], [list(gripper_pos)], []
+    dev = model.h_init.device
     h = model.initial_feedback(1)
 
     for t in range(steps):
@@ -339,15 +347,15 @@ def run_inference(
             gripper_pos, targets, hidden_colors=hidden_colors_at(hidden_steps, t, target_color)
         )
         frames.append(img)
-        img_b = img.unsqueeze(0)
+        img_b = img.unsqueeze(0).to(dev)
 
-        logits_x, _, h_next, info = model(img_b, torch.tensor([prefix]), h)
+        logits_x, _, h_next, info = model(img_b, torch.tensor([prefix], device=dev), h)
         x_probs = F.softmax(logits_x[0, -1, X_OFFSET : X_OFFSET + NUM_BINS], dim=-1)
         x_bin = int(x_probs.argmax())
         act_x_tok = X_OFFSET + x_bin
 
         # Same h_{t-1} for the Y pass -> same weight set within one control step
-        logits_y, _, _, _ = model(img_b, torch.tensor([prefix + [act_x_tok]]), h)
+        logits_y, _, _, _ = model(img_b, torch.tensor([prefix + [act_x_tok]], device=dev), h)
         y_probs = F.softmax(logits_y[0, -1, Y_OFFSET : Y_OFFSET + NUM_BINS], dim=-1)
         y_bin = int(y_probs.argmax())
         act_y_tok = Y_OFFSET + y_bin
@@ -368,10 +376,10 @@ def run_inference(
                 "dx": dx,
                 "dy": dy,
                 "dist": dist,
-                "x_probs": x_probs,
-                "y_probs": y_probs,
-                "choice": int(info["g"].argmax()),
-                "p_choice": info["p"][0].tolist(),
+                "x_probs": x_probs.cpu(),
+                "y_probs": y_probs.cpu(),
+                "choice": int(info["g"].argmax().item()),
+                "p_choice": info["p"][0].cpu().tolist(),
             }
         )
 
@@ -400,16 +408,19 @@ if __name__ == "__main__":
     ep_images, ep_inputs, ep_targets = to_episodes(images, input_seqs, target_seqs, EPISODE_LEN)
 
     model = FeedbackMicroVLA(vocab_size=VOCAB_SIZE, d_model=64, n_layers=3, n_heads=4)
-    init_switched = [p.detach().clone() for p in switched_params(model)]
-    print(f"Initialized FeedbackMicroVLA | Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    init_switched = [p.detach().cpu().clone() for p in switched_params(model)]
+    print(
+        f"Initialized FeedbackMicroVLA | Parameters: {sum(p.numel() for p in model.parameters()):,} "
+        f"| Device: {DEVICE}"
+    )
 
-    print("\n--- Training FeedbackMicroVLA on CPU (full-episode BPTT) ---")
+    print(f"\n--- Training FeedbackMicroVLA on {DEVICE} (full-episode BPTT) ---")
     history = train_feedback_vla(model, ep_images, ep_inputs, ep_targets, steps=520)
 
     # Verify both weight sets actually learned: distance moved from init, per set
     moved = torch.zeros(NUM_CHOICES)
     for p0, p in zip(init_switched, switched_params(model)):
-        moved += (p.detach() - p0).flatten(1).pow(2).sum(1)
+        moved += (p.detach().cpu() - p0).flatten(1).pow(2).sum(1)
     moved = moved.sqrt().tolist()
     usage_total = torch.tensor(history["usage"]).mean(0).tolist()
     print(

@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from micro_vla import (
+    DEVICE,
     VOCAB_SIZE,
     NUM_PATCHES,
     CausalSelfAttention,
@@ -84,9 +85,14 @@ def train_sequential_episodes(
     lr: float = 4e-3,
     batch_schedule=None,
     log_every: int = 130,
+    device: torch.device = DEVICE,
 ):
     """Same optimizer, LR schedule and episode batches as train_feedback_vla, but no recurrence:
     the [streams, L] timesteps are flattened into one batch of independent samples."""
+    model.to(device)
+    ep_images = ep_images.to(device)
+    ep_inputs = ep_inputs.to(device)
+    ep_targets = ep_targets.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
     num_episodes = ep_images.size(0) // 3
     eps_per_batch = max(1, streams_per_batch // 3)
@@ -102,9 +108,9 @@ def train_sequential_episodes(
                 pg["lr"] = lr * max(0.1, 1.0 - 0.9 * frac)
 
         if batch_schedule is not None:
-            ep_idx = batch_schedule[step - 1] * 3
+            ep_idx = batch_schedule[step - 1].to(device) * 3
         else:
-            ep_idx = torch.randint(0, num_episodes, (eps_per_batch,)) * 3
+            ep_idx = torch.randint(0, num_episodes, (eps_per_batch,), device=device) * 3
         idx = torch.cat([ep_idx, ep_idx + 1, ep_idx + 2])
         imgs = ep_images[idx].flatten(0, 1)
         inps = ep_inputs[idx].flatten(0, 1)
@@ -138,10 +144,10 @@ if __name__ == "__main__":
     model = SequentialMicroVLA(vocab_size=VOCAB_SIZE, d_model=64, n_layers=3, n_heads=4)
     print(
         f"Initialized SequentialMicroVLA | Parameters: {sum(p.numel() for p in model.parameters()):,} "
-        f"| Sequence Length: {NUM_PATCHES + 4} tokens"
+        f"| Sequence Length: {NUM_PATCHES + 4} tokens | Device: {DEVICE}"
     )
 
-    print("\n--- Training SequentialMicroVLA on CPU (same episode batches as feedback model) ---")
+    print(f"\n--- Training SequentialMicroVLA on {DEVICE} (same episode batches as feedback model) ---")
     loss_history = train_sequential_episodes(model, ep_images, ep_inputs, ep_targets, steps=520)
 
     eval_env_state = sample_env_state()
