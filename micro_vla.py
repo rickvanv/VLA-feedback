@@ -96,8 +96,9 @@ TARGET_SLOTS = [
 ]
 
 
-def render_env(gripper_pos, targets) -> torch.Tensor:
-    """Render a 32x32x3 RGB float tensor with 3x3 colored target dots and a 3x3 white gripper."""
+def render_env(gripper_pos, targets, show_targets: bool = True) -> torch.Tensor:
+    """Render a 32x32x3 RGB float tensor with 3x3 colored target dots and a 3x3 white gripper.
+    With show_targets=False the targets are occluded (only the gripper is drawn)."""
     img = torch.zeros(IMG_SIZE, IMG_SIZE, 3, dtype=torch.float32)
 
     def draw_square(pos, color, radius=1):
@@ -106,10 +107,21 @@ def render_env(gripper_pos, targets) -> torch.Tensor:
         y0, y1 = max(0, cy - radius), min(IMG_SIZE, cy + radius + 1)
         img[y0:y1, x0:x1] = color
 
-    for color_name, t_pos in targets.items():
-        draw_square(t_pos, COLORS[color_name], radius=1)
+    if show_targets:
+        for color_name, t_pos in targets.items():
+            draw_square(t_pos, COLORS[color_name], radius=1)
     draw_square(gripper_pos, GRIPPER_COLOR, radius=1)
     return img
+
+
+def sample_occlusion(
+    episode_len: int, min_len: int = 2, max_len: int = 4, first_visible: int = 2
+) -> set:
+    """Pick one window of consecutive timesteps during which all targets are invisible.
+    The first `first_visible` frames always show the targets so they can be memorized."""
+    length = random.randint(min_len, max_len)
+    start = random.randint(first_visible, max(first_visible, episode_len - length))
+    return set(range(start, min(episode_len, start + length)))
 
 
 def sample_env_state():
@@ -125,24 +137,36 @@ def sample_env_state():
     return gripper_pos, targets
 
 
-def generate_vla_dataset(num_episodes: int = 500, episode_len: int = 15):
+def generate_vla_dataset(
+    num_episodes: int = 500,
+    episode_len: int = 15,
+    occlusion_prob: float = 0.0,
+    return_hidden: bool = False,
+):
     """
     Generate on-the-fly expert trajectories using a proportional controller.
     To prevent causal confusion (ignoring the prompt and moving toward whichever dot is closest),
     each rendered state along a trajectory is paired with all 3 counterfactual language prompts.
+    With probability `occlusion_prob` an episode gets a window of 2-4 frames in which the targets
+    are not rendered; the expert still acts on the true target positions (requires memory).
     Unified Sequence Structure per timestep:
       Input Sequence:  [PATCH_0 ... PATCH_63] | ["reach", <color>] | ["ACT_START"] | [ACT_X_BIN]
       Target Sequence: [   ... ignored ...  ] | [  ... ignored ... ] |  [ACT_X_BIN]  | [ACT_Y_BIN]
     """
-    images, input_seqs, target_seqs = [], [], []
+    images, input_seqs, target_seqs, hidden_flags = [], [], [], []
     color_names = list(COLORS.keys())
 
     for _ in range(num_episodes):
         gripper_pos, targets = sample_env_state()
         nav_color = random.choice(color_names)
+        hidden = (
+            sample_occlusion(episode_len)
+            if occlusion_prob > 0 and random.random() < occlusion_prob
+            else set()
+        )
 
-        for _ in range(episode_len):
-            img = render_env(gripper_pos, targets)
+        for t in range(episode_len):
+            img = render_env(gripper_pos, targets, show_targets=t not in hidden)
 
             # Supervise all 3 language instructions ("reach red/green/blue") on the same visual state
             for target_color in color_names:
@@ -166,6 +190,7 @@ def generate_vla_dataset(num_episodes: int = 500, episode_len: int = 15):
                 images.append(img)
                 input_seqs.append(seq_in)
                 target_seqs.append(seq_tgt)
+                hidden_flags.append(t in hidden)
 
             # Step the environment along the active trajectory using the quantized action
             nav_goal = targets[nav_color]
@@ -177,11 +202,14 @@ def generate_vla_dataset(num_episodes: int = 500, episode_len: int = 15):
                 max(2.0, min(29.0, gripper_pos[1] + bin_to_action(yb) * MAX_STEP_PX)),
             ]
 
-    return (
+    data = (
         torch.stack(images),  # [N, 32, 32, 3]
         torch.tensor(input_seqs, dtype=torch.long),  # [N, 4]
         torch.tensor(target_seqs, dtype=torch.long),  # [N, 4]
     )
+    if return_hidden:
+        return data + (torch.tensor(hidden_flags, dtype=torch.bool),)  # [N] targets occluded?
+    return data
 
 
 # ------------------------------------------------------------------------------
@@ -359,14 +387,20 @@ def train_vla(
 
 @torch.no_grad()
 def run_inference(
-    model: MicroVLA, prompt: str = "reach blue", steps: int = 15, env_state=None
+    model: MicroVLA,
+    prompt: str = "reach blue",
+    steps: int = 15,
+    env_state=None,
+    hidden_steps=None,
 ):
     """
     Closed-loop autoregressive rollout on an unseen environment state:
       1. Feed 32x32 RGB image + ["reach", <color>, "ACT_START"] -> predict ACT_X_BIN -> delta_x
       2. Append ACT_X_BIN -> predict ACT_Y_BIN -> delta_y
       3. Step synthetic environment and repeat for `steps` timesteps.
+    Targets are not rendered at timesteps in `hidden_steps` (occlusion).
     """
+    hidden_steps = hidden_steps or set()
     model.eval()
     words = prompt.strip().lower().split()
     assert (
@@ -383,7 +417,7 @@ def run_inference(
     frames, trajectory, step_records = [], [list(gripper_pos)], []
 
     for t in range(steps):
-        img = render_env(gripper_pos, targets)
+        img = render_env(gripper_pos, targets, show_targets=t not in hidden_steps)
         frames.append(img)
         img_batch = img.unsqueeze(0)  # [1, 32, 32, 3]
 
@@ -484,7 +518,10 @@ def print_ascii_rollout(rollout: dict):
 
 
 def save_demo_gif(
-    rollouts: list, loss_history: list, save_path: str = "micro_vla_demo.gif"
+    rollouts: list,
+    loss_history: list,
+    save_path: str = "micro_vla_demo.gif",
+    title: str = "micro_vla.py — Vision-Language-Action Transformer (64 Vision Patches + Unified Action Tokens)",
 ):
     """Save an animated GIF visualizing the RGB camera observations, patch grid, and action bin distributions."""
     import matplotlib
@@ -596,7 +633,7 @@ def save_demo_gif(
     ax_ybin.set_xlabel("Decoded Velocity delta_y", color="#8b949e", fontsize=8)
 
     fig.suptitle(
-        "micro_vla.py — Vision-Language-Action Transformer (64 Vision Patches + Unified Action Tokens)",
+        title,
         color="#f0f6fc",
         fontsize=12,
         fontweight="bold",
@@ -616,9 +653,10 @@ def save_demo_gif(
 
             rec_idx = min(frame_idx, len(r["records"]) - 1)
             rec = r["records"][rec_idx]
-            step_texts[i].set_text(
-                f"t={frame_idx:2d} dist={rec['dist']:.1f}px\n({rec['dx']:+.2f},{rec['dy']:+.2f})"
-            )
+            label = f"t={frame_idx:2d} dist={rec['dist']:.1f}px\n({rec['dx']:+.2f},{rec['dy']:+.2f})"
+            if "choice" in rec:  # feedback model: show which weight set was selected
+                label += f" W:{'AB'[rec['choice']]}"
+            step_texts[i].set_text(label)
 
         # Update action token probability histograms for the primary ("reach blue") rollout
         rec_blue = rollouts[0]["records"][
