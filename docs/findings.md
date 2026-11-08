@@ -75,18 +75,25 @@ When evaluated under identical training budgets (`520` steps, `24` streams $\tim
 2. **1-Bit Information Bottleneck in Hard Gate Routing**: In `FeedbackMicroVLA`, the recurrent state $h_{t-1}$ only influences step $t$ through a binary choice $g_t \in \{A, B\}$ of block-0 FFN weights (`1 bit` of information per step). A 1-bit discrete switch cannot encode continuous 2D spatial coordinates $(x, y)$ of an occluded target across frames, explaining why `val_ce_occluded` (`1.605`) does not beat the memoryless sequential baseline (`1.554`). To carry spatial target memory across occluded frames, $h_{t-1}$ needs a continuous residual/token pathway (or KV-cache recurrence) rather than solely a discrete binary gate.
 3. **Training Throughput & Sample Diversity per Step**: Training on `8` episodes (`24` streams $\times 10$ correlated frames $= 240$ sequences) with sequential unrolling is ~1.8$\times$ slower per step than flattened parallel execution and has lower state diversity per gradient update than standard i.i.d. state sampling (`24` independent states $\times 3$ prompts in [`train_vla`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla.py#L369-L410)), requiring more optimization steps when training on occluded episode streams.
 
-### Finding 3: Moving-Target Experiment (`--target-speed 0.7 --occlusion-prob 0.0`)
-When targets move slowly along non-colliding straight lines (`0.7` px/step, minimum separation `6.0` px) and the expert aims at the target's next step position along its line, a single frame cannot disambiguate the target's velocity direction. Across `3` seeds (`[0, 1, 2]`, `520` steps):
+### Finding 3: Moving-Target Experiment & Signed 2D Basis Mixing (`--target-speed 0.7 --occlusion-prob 0.0`)
+When targets move slowly along non-colliding straight lines (`0.7` px/step, minimum separation `6.0` px) and the expert aims at the target's next step position along its line, a single frame cannot disambiguate the target's velocity direction.
 
-| Metric (Mean $\pm$ Std over Seeds `0, 1, 2`) | `FeedbackMicroVLA` (`137,307` params) | `SequentialMicroVLA` (`137,307` params) |
-| :--- | :---: | :---: |
-| **`train_ce (last 20)`** | **`1.281 ± 0.082`** | `1.359 ± 0.138` |
-| **`val_ce_visible`** | **`1.452 ± 0.097`** | `1.487 ± 0.123` |
-| **`final_dist_px`** | `9.839 ± 1.955` | **`8.742 ± 2.919`** |
-| **`success_rate (< 1.5px)`** | `0.052 ± 0.050` | **`0.063 ± 0.042`** |
+To let two FFN matrices span all $360^\circ$ movement directions while keeping both weight sets active on every step, we added `gate_mode="mix"` in [`FeedbackMicroVLA`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla_feedback.py#L121-L214):
+$$g_t = \tanh(\text{MLP}(h_{t-1})) \in [-1, 1]^2, \quad \Delta x = g_{t,0}\,\text{FFN}_A(\text{LN}_2(x)) + g_{t,1}\,\text{FFN}_B(\text{LN}_2(x))$$
+regularized by [`ortho_loss`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla_feedback.py#L232-L236) ($\|\frac{1}{B}G^\top G - 0.5 I_2\|_F^2$) so $g_{t,0}$ and $g_{t,1}$ stay orthogonal with balanced variance.
 
-- **Lower Action Token Cross-Entropy with Feedback**: Unlike the static-target occlusion setting, `FeedbackMicroVLA` achieves lower training cross-entropy (`1.281` vs. `1.359`) and lower validation cross-entropy (`1.452` vs. `1.487`) than `SequentialMicroVLA` when targets move along lines, as the recurrent state $h_{t-1}$ provides temporal context across consecutive frames.
-- **Closed-Loop Tracking**: In 15-step closed-loop rollouts where targets continuously move, `SequentialMicroVLA` still edges out slightly on final Euclidean distance (`8.742px` vs. `9.839px`), reflecting the benefit of using both FFN blocks on every step when executing coarse pursuit movements.
+Across `3` seeds (`[0, 1, 2]`, `520` steps, `137,307` parameters for all three models):
+
+| Metric (Mean $\pm$ Std over Seeds `0, 1, 2`) | `feedback_mix` (Signed 2D Mix) | `feedback_switch` (Hard A/B Switch) | `sequential` (Feedforward A $\to$ B) |
+| :--- | :---: | :---: | :---: |
+| **`train_ce (last 20)`** | **`1.205 ± 0.231`** | `1.275 ± 0.072` | `1.356 ± 0.076` |
+| **`val_ce_visible`** | **`1.404 ± 0.254`** | `1.433 ± 0.115` | `1.496 ± 0.106` |
+| **`final_dist_px`** | **`7.196 ± 2.634`** | `9.735 ± 2.621` | `7.574 ± 2.064` |
+| **`mean_dist_px`** | **`6.589 ± 2.238`** | `8.210 ± 2.430` | `7.359 ± 1.615` |
+| **`success_rate (< 1.5px)`** | `0.074 ± 0.053` | `0.022 ± 0.011` | **`0.081 ± 0.013`** |
+
+- **`feedback_mix` Achieves the Best Cross-Entropy and Closed-Loop Tracking Distance**: By taking a signed 2D linear combination of $\text{FFN}_A$ and $\text{FFN}_B$ conditioned on $h_{t-1}$, `feedback_mix` outperforms **both** `feedback_switch` and `sequential` on training loss (`1.205`), validation loss (`1.404`), mean rollout distance to the moving target (`6.589px` vs. `7.359px` sequential and `8.210px` switch), and final rollout distance (`7.196px` vs. `7.574px` sequential and `9.735px` switch).
+- **Overlaid Trajectory Visualization**: Saved to [`micro_vla_demo_moving_overlay.gif`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/micro_vla_demo_moving_overlay.gif) via [`save_overlay_gif`](file:///Users/rickvanvoorbergen/Documents/repos/microvla/compare_feedback_sequential.py#L179-L384).
 
 ---
 
