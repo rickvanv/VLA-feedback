@@ -10,10 +10,10 @@ instead of a gate selecting one of them per sample, they are applied one after a
 
 So every sample always uses both weight sets. There is no feedback connection and no gate.
 
-Exact parameter match with micro_vla_feedback.py (both 137,307 params):
-  feedback extras over baseline:   2nd FFN set (16,576) + gate MLP 64->51->2 (3,421) + h_init (64)
-  sequential extras over baseline: FFN_B with hidden 155 instead of 128 (20,061) + LN3 w/o affine (0)
-  -> 16,576 + 3,421 + 64 = 20,061
+Exact parameter match with micro_vla_feedback.py (both 138,081 params):
+  feedback extras over baseline:   4x64 FFN sets (+16,704) + state_mlp 68->53->8 (4,089)
+                                   + state_step 4x4 (16) + gate_proj 4x4+4 (20) + s_init (4) = 20,833
+  sequential extras over baseline: FFN_B with hidden 161 instead of 128 (20,833) + LN3 w/o affine (0)
 
 Training uses the same episode batches as the feedback model (see train_sequential_episodes):
 every update sees exactly the same 24 streams x 10 timesteps, just without recurrence.
@@ -39,7 +39,7 @@ from micro_vla import (
 )
 from micro_vla_feedback import to_episodes
 
-FFN_B_EXTRA_HIDDEN = 27  # widens FFN_B so the param count equals micro_vla_feedback.py exactly
+FFN_B_EXTRA_HIDDEN = 33  # widens FFN_B so the param count equals micro_vla_feedback.py (138,081) exactly
 
 
 def make_ffn(d_model: int, hidden: int) -> nn.Sequential:

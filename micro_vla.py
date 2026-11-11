@@ -770,7 +770,7 @@ def save_demo_gif(
             rec = r["records"][rec_idx]
             label = f"t={frame_idx:2d} dist={rec['dist']:.1f}px\n({rec['dx']:+.2f},{rec['dy']:+.2f})"
             if "choice" in rec:  # feedback model: show which weight set was selected
-                label += f" W:{'AB'[rec['choice']]}"
+                label += f" W:{'ABCD'[rec['choice']]}"
             step_texts[i].set_text(label)
 
         # Update action token probability histograms for the primary ("reach blue") rollout

@@ -5,16 +5,25 @@ Built on top of micro_vla.py (env, tokenizer, data and visualization are reused 
 
 What is new
 -----------
-The FFN of the *first* Transformer block owns TWO complete sets of weight matrices
-(W1_a, W2_a) and (W1_b, W2_b). Which set is used at control step t is decided by a small
-gating MLP that reads the model's *final hidden state from the previous step t-1*:
+The FFN of the *first* Transformer block owns FOUR half-width basis weight sets
+(A, B, C, D) to span the 4-dimensional moving-target state (x, y, v_x, v_y). How those 4 sets
+are combined or selected at control step t is decided by a gating MLP that reads the model's
+*recurrent state from the previous step t-1*:
 
-    h_{t-1}  --gate MLP-->  logits (2)  --Gumbel-softmax-->  g_t (one-hot, straight-through)
-    W_t = g_t[0] * W_a + g_t[1] * W_b              (per sample, inside block 0's FFN)
+  - gate_mode='mix':    4D signed basis combination g_t = tanh(MLP(h_{t-1})) in [-1, 1]^4
+                        Delta_x = sum_{k=1..4} g_t[k] * FFN_k(LN2(x))
+  - gate_mode='switch': discrete selection of one of the 4 weight sets via Gumbel-softmax
 
-"Final hidden state" = output of the last block (after ln_f) at the ACT_START position.
-Because attention is causal, that vector is identical for the X-pass and the Y-pass of a
-step, so the feedback is well defined regardless of how many action tokens were decoded.
+To prevent multi-frame occlusions (2-4 frames) from overwriting the remembered target state
+while avoiding 64D recurrent overfitting, the model carries a strict 4D state bottleneck
+s_t in [-1, 1]^4 across timesteps via a gated 4x4 state-space transition:
+    u_t           = 0.5 * (h_final[COLOR_POS] + h_final[ACT_START_POS])
+    s_hat, z_gate = state_mlp([u_t, s_{t-1}]).chunk(2, dim=-1)
+    alpha_t       = sigmoid(z_gate)                          in (0, 1)^4
+    s_t           = (1 - alpha_t) * tanh(A s_{t-1}) + alpha_t * tanh(s_hat)   in [-1, 1]^4
+Because attention is causal, both COLOR_POS and ACT_START_POS are identical for the X-pass
+and the Y-pass of a step, and reading from COLOR_POS decouples the 4D spatial memory from
+the 1-step action classification head (lm_head) at ACT_START_POS.
 
 Making sure BOTH weight sets are trained
 ----------------------------------------
@@ -69,7 +78,8 @@ from micro_vla import (
     stoi,
 )
 
-NUM_CHOICES = 2  # number of alternative weight sets in the switched block
+NUM_CHOICES = 4  # 4 FFN basis branches to span 4D target state (x, y, v_x, v_y)
+COLOR_POS = NUM_PATCHES + 1  # index of <color> in [patches.., "reach", color, ACT_START, ..]
 ACT_START_POS = NUM_PATCHES + 2  # index of ACT_START in [patches.., "reach", color, ACT_START, ..]
 
 
@@ -94,22 +104,22 @@ class SwitchedLinear(nn.Module):
 
 
 class FeedbackTransformerBlock(nn.Module):
-    """Pre-norm block whose FFN weights are selected or linearly mixed per sample by a feedback gate."""
+    """Pre-norm block whose K=4 half-width FFN basis branches are selected or linearly mixed by a 4D feedback gate."""
 
-    def __init__(self, d_model: int = 64, n_heads: int = 4):
+    def __init__(self, d_model: int = 64, n_heads: int = 4, ffn_hidden: int = 64):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads)
         self.ln2 = nn.LayerNorm(d_model)
-        self.fc1 = SwitchedLinear(d_model, 2 * d_model)
-        self.fc2 = SwitchedLinear(2 * d_model, d_model)
+        self.fc1 = SwitchedLinear(d_model, ffn_hidden, num_choices=NUM_CHOICES)
+        self.fc2 = SwitchedLinear(ffn_hidden, d_model, num_choices=NUM_CHOICES)
 
     def forward(self, x: torch.Tensor, g: torch.Tensor, mix_branches: bool = False) -> torch.Tensor:
         x = x + self.attn(self.ln1(x))
         x_ln = self.ln2(x)
         if mix_branches:
-            # Linear combination of the two FFN branch outputs with signed 2D basis weights g in [-1, 1]^2:
-            # Delta_x = g[:, 0] * FFN_A(x_ln) + g[:, 1] * FFN_B(x_ln)
+            # Linear combination of the K=4 FFN branch outputs with signed 4D basis weights g in [-1, 1]^4:
+            # Delta_x = sum_{k=0..3} g[:, k] * FFN_k(x_ln)
             h = F.gelu(torch.einsum("bti,koi->btko", x_ln, self.fc1.weight) + self.fc1.bias)
             y = torch.einsum("btkh,koh->btko", h, self.fc2.weight) + self.fc2.bias
             x = x + torch.einsum("bk,btko->bto", g, y)
@@ -122,9 +132,9 @@ class FeedbackTransformerBlock(nn.Module):
 # Model
 # ------------------------------------------------------------------------------
 class FeedbackMicroVLA(nn.Module):
-    """MicroVLA where block 0's FFN is controlled by h_{t-1}:
-    - gate_mode='mix':    signed 2D linear combination g = tanh(MLP(h_{t-1})) in [-1, 1]^2 of FFN_A and FFN_B
-    - gate_mode='switch': discrete selection of weight set A or B via Gumbel-softmax
+    """MicroVLA where block 0's 4 FFN basis branches are controlled by a 4D recurrent state s_{t-1} in [-1, 1]^4:
+    - gate_mode='mix':    signed 4D linear combination g = tanh(gate_proj(s_{t-1})) in [-1, 1]^4 of FFN_{A,B,C,D}
+    - gate_mode='switch': discrete selection of weight set A, B, C, or D via Gumbel-softmax
     """
 
     def __init__(
@@ -133,7 +143,7 @@ class FeedbackMicroVLA(nn.Module):
         d_model: int = 64,
         n_layers: int = 3,
         n_heads: int = 4,
-        gate_hidden: int = 51,  # 51 makes the param count exactly match micro_vla_sequential.py
+        state_hidden: int = 53,  # 53 makes the param count exactly match micro_vla_sequential.py (138,081)
         gate_mode: str = "mix",
     ):
         super().__init__()
@@ -144,31 +154,37 @@ class FeedbackMicroVLA(nn.Module):
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.token_pos_emb = nn.Parameter(torch.randn(1, 8, d_model) * 0.02)
         self.blocks = nn.ModuleList(
-            [FeedbackTransformerBlock(d_model, n_heads)]
+            [FeedbackTransformerBlock(d_model, n_heads, ffn_hidden=d_model)]
             + [TransformerBlock(d_model, n_heads) for _ in range(n_layers - 1)]
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
-        # Feedback path: h_{t-1} -> gate logits. h_init is the learned "previous state" at t=0.
-        self.h_init = nn.Parameter(torch.zeros(d_model))
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(d_model, gate_hidden),
+        # True 4D recurrent state bottleneck s_{t-1} in [-1, 1]^4: cannot memorize 64D episode embeddings
+        self.h_init = nn.Parameter(torch.tensor([0.6, -0.6, 0.6, -0.6]))
+        self.state_step = nn.Linear(NUM_CHOICES, NUM_CHOICES, bias=False)
+        self.state_mlp = nn.Sequential(
+            nn.Linear(d_model + NUM_CHOICES, state_hidden),
             nn.GELU(),
-            nn.Linear(gate_hidden, NUM_CHOICES),
+            nn.Linear(state_hidden, 2 * NUM_CHOICES),
         )
-        if gate_mode == "mix":
-            with torch.no_grad():
-                self.gate_mlp[-1].bias.add_(0.8)  # start both branches active (tanh(0.8) ~ 0.66)
+        self.gate_proj = nn.Linear(NUM_CHOICES, NUM_CHOICES)
+        with torch.no_grad():
+            # Initialize 4x4 state transition with constant-velocity coupling (pos += 0.5 * vel)
+            nn.init.eye_(self.state_step.weight)
+            self.state_step.weight[0, 2] = 0.5
+            self.state_step.weight[1, 3] = 0.5
+            nn.init.eye_(self.gate_proj.weight)
+            nn.init.zeros_(self.gate_proj.bias)
 
     def initial_feedback(self, batch_size: int) -> torch.Tensor:
         return self.h_init.unsqueeze(0).expand(batch_size, -1)
 
     def gate(self, h_prev: torch.Tensor, tau: float = 1.0, hard: bool = True):
-        """Return (g [B,K] used for routing/mixing, p [B,K] probabilities or signed weights)."""
-        logits = self.gate_mlp(h_prev)
+        """Return (g [B,4] used for routing/mixing, p [B,4] probabilities or signed 4D weights)."""
+        logits = self.gate_proj(h_prev)
         if self.gate_mode == "mix":
-            g = torch.tanh(logits)  # signed 2D basis weights in [-1, 1]^2
+            g = torch.tanh(logits)  # signed 4D basis weights in [-1, 1]^4
             return g, g
         p = F.softmax(logits, dim=-1)
         if self.training:
@@ -198,7 +214,13 @@ class FeedbackMicroVLA(nn.Module):
             x = block(x)
         h = self.ln_f(x)
         logits = self.lm_head(h)
-        h_next = h[:, ACT_START_POS, :]  # final hidden state fed back at step t+1
+
+        # Read observation summary and update the bounded 4D state s_t in [-1, 1]^4
+        u_t = 0.5 * (h[:, COLOR_POS, :] + h[:, ACT_START_POS, :])
+        s_hat, z_alpha = self.state_mlp(torch.cat([u_t, h_prev], dim=-1)).chunk(2, dim=-1)
+        alpha = torch.sigmoid(z_alpha)
+        s_step = torch.tanh(self.state_step(h_prev))
+        h_next = (1.0 - alpha) * s_step + alpha * torch.tanh(s_hat)
 
         loss = None
         if targets is not None:
@@ -227,8 +249,8 @@ def decisiveness_loss(p: torch.Tensor) -> torch.Tensor:
     return -(p * torch.log(p + 1e-9)).sum(-1).mean()
 
 
-def ortho_loss(g: torch.Tensor, target_var: float = 0.5) -> torch.Tensor:
-    """Encourage signed 2D basis weights g [B, 2] to be orthogonal and have equal second moment."""
+def ortho_loss(g: torch.Tensor, target_var: float = 0.25) -> torch.Tensor:
+    """Encourage signed 4D basis weights g [B, 4] to be orthogonal and have equal second moment (4 * 0.25 = 1)."""
     gram = (g.T @ g) / max(1, g.size(0))
     target = target_var * torch.eye(g.size(-1), device=g.device)
     return (gram - target).pow(2).sum()
@@ -348,10 +370,11 @@ def train_feedback_vla(
         history["grad"].append(grads)
         if log_every and (step % log_every == 0 or step == 1 or step == steps):
             mode_str = "mix(|g|)" if model.gate_mode == "mix" else f"tau:{tau:.2f} {'hard' if hard else 'soft'}"
+            u_str = "/".join(f"{u:.2f}" for u in usage)
+            g_str = "/".join(f"{gr:.2f}" for gr in grads)
             print(
                 f"step {step:4d}/{steps} | ce: {ce_mean.item():.4f} | {mode_str} "
-                f"| A/B: {usage[0]:.2f}/{usage[1]:.2f} "
-                f"| grad A/B: {grads[0]:.3f}/{grads[1]:.3f} | {time.time() - t0:5.1f}s"
+                f"| A..D: {u_str} | grad A..D: {g_str} | {time.time() - t0:5.1f}s"
             )
 
     return history
@@ -475,9 +498,11 @@ if __name__ == "__main__":
         moved += (p.detach().cpu() - p0).flatten(1).pow(2).sum(1)
     moved = moved.sqrt().tolist()
     usage_total = torch.tensor(history["usage"]).mean(0).tolist()
+    moved_str = "  ".join(f"{'ABCD'[k]}={moved[k]:.3f}" for k in range(NUM_CHOICES))
+    usage_str = "/".join(f"{u:.2f}" for u in usage_total)
     print(
-        f"\nWeight-set update norm (||W - W_init||): A={moved[0]:.3f}  B={moved[1]:.3f} | "
-        f"avg training usage A/B: {usage_total[0]:.2f}/{usage_total[1]:.2f}"
+        f"\nWeight-set update norm (||W - W_init||): {moved_str} | "
+        f"avg training usage A..D: {usage_str}"
     )
     if min(moved) < 0.1 * max(moved):
         print("WARNING: one weight set barely trained (routing collapse).")
@@ -498,7 +523,7 @@ if __name__ == "__main__":
     ]
     for r in rollouts:
         print_ascii_rollout(r)
-        print("  weight set per step: " + "".join("AB"[rec["choice"]] for rec in r["records"]))
+        print("  weight set per step: " + "".join("ABCD"[rec["choice"]] for rec in r["records"]))
 
     save_demo_gif(
         rollouts,

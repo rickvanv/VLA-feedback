@@ -1,10 +1,10 @@
 """
 compare_feedback_sequential.py: Fair multi-seed comparison of parameter-matched VLA variants:
-  - feedback_mix:    signed 2D linear combination g = tanh(MLP(h_{t-1})) in [-1, 1]^2 of FFN_A and FFN_B
-  - feedback_switch: discrete selection of FFN_A or FFN_B via Gumbel-softmax from h_{t-1}
+  - feedback_mix:    signed 4D linear combination g = tanh(MLP(h_{t-1})) in [-1, 1]^4 of FFN_{A,B,C,D}
+  - feedback_switch: discrete selection of FFN_{A,B,C,D} via Gumbel-softmax from h_{t-1}
   - sequential:      feedforward FFN_A followed by FFN_B (no recurrence, no gate)
 
-All three models have the exact same parameter count (137,307 parameters) and receive:
+All three models have the exact same parameter count (138,081 parameters) and receive:
   - the same training dataset and held-out validation dataset
   - the exact same sequence of episode batches (shared batch schedule)
   - the same optimizer, LR schedule and number of updates
@@ -312,22 +312,26 @@ def save_overlay_gif(
         dist_curves[name] = line
     ax_dist.legend(loc="upper right", fontsize=7, facecolor="#0d1117", edgecolor="#30363d", labelcolor="#e6edf3")
 
-    # Bottom-Middle: 2D Signed Gate Space (g_0, g_1) in [-1, 1]^2 for feedback_mix
+    # Bottom-Middle: 4D Signed Gate Space (g_A, g_B) solid & (g_C, g_D) dashed in [-1, 1]^2 for feedback_mix
     ax_gate.set_xlim(-1.1, 1.1)
     ax_gate.set_ylim(-1.1, 1.1)
     ax_gate.axhline(0.0, color="#30363d", linewidth=0.8, linestyle="--")
     ax_gate.axvline(0.0, color="#30363d", linewidth=0.8, linestyle="--")
-    ax_gate.set_title("Feedback (Mix) 2D Gate Weights (g_A, g_B)", color="#e6edf3", fontsize=9.5, pad=6)
-    ax_gate.set_xlabel("g_A (FFN_A weight)", color="#8b949e", fontsize=8)
-    ax_gate.set_ylabel("g_B (FFN_B weight)", color="#8b949e", fontsize=8)
+    ax_gate.set_title("Feedback (Mix) 4D Gate (g_A,g_B solid | g_C,g_D dashed)", color="#e6edf3", fontsize=9.0, pad=6)
+    ax_gate.set_xlabel("g_A / g_C weight", color="#8b949e", fontsize=8)
+    ax_gate.set_ylabel("g_B / g_D weight", color="#8b949e", fontsize=8)
     ax_gate.grid(True, color="#21262d", linestyle=":", linewidth=0.5)
 
-    gate_lines, gate_dots = [], []
+    gate_lines, gate_dots, gate_lines_cd, gate_dots_cd = [], [], [], []
     for p_idx, tc in enumerate(prompt_colors):
-        (gl,) = ax_gate.plot([], [], color=title_colors[tc], linewidth=1.2, alpha=0.8, label=f"reach {tc}")
+        (gl,) = ax_gate.plot([], [], color=title_colors[tc], linewidth=1.2, alpha=0.85, label=f"reach {tc}")
         (gd,) = ax_gate.plot([], [], marker="o", markersize=5, color=title_colors[tc], markeredgecolor="#ffffff")
+        (gl_cd,) = ax_gate.plot([], [], color=title_colors[tc], linewidth=1.0, linestyle="--", alpha=0.65)
+        (gd_cd,) = ax_gate.plot([], [], marker="s", markersize=4.5, color=title_colors[tc], markeredgecolor="#ffffff")
         gate_lines.append(gl)
         gate_dots.append(gd)
+        gate_lines_cd.append(gl_cd)
+        gate_dots_cd.append(gd_cd)
     ax_gate.legend(loc="lower left", fontsize=7, facecolor="#0d1117", edgecolor="#30363d", labelcolor="#e6edf3")
 
     # Top Row: 3 Prompts with Overlaid Variant Trajectories
@@ -451,15 +455,20 @@ def save_overlay_gif(
         for name, line in dist_curves.items():
             line.set_data(xs_t, dist_series[name][: frame_idx + 1])
 
-        # Update 2D gate plot for feedback_mix
+        # Update 4D gate plot for feedback_mix
         if "feedback_mix" in rollouts_by_model:
-            n_g = min( max(1, frame_idx), steps)
+            n_g = min(max(1, frame_idx), steps)
             for p_idx in range(3):
                 recs = rollouts_by_model["feedback_mix"][p_idx]["records"][:n_g]
                 gxs = [rec["p_choice"][0] for rec in recs]
                 gys = [rec["p_choice"][1] for rec in recs]
                 gate_lines[p_idx].set_data(gxs, gys)
                 gate_dots[p_idx].set_data([gxs[-1]], [gys[-1]])
+                if len(recs[0]["p_choice"]) >= 4:
+                    gx_cd = [rec["p_choice"][2] for rec in recs]
+                    gy_cd = [rec["p_choice"][3] for rec in recs]
+                    gate_lines_cd[p_idx].set_data(gx_cd, gy_cd)
+                    gate_dots_cd[p_idx].set_data([gx_cd[-1]], [gy_cd[-1]])
 
         return im_artists + step_texts
 
